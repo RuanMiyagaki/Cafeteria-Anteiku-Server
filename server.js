@@ -1,9 +1,10 @@
+const crypto = require('crypto'); // Ferramenta nativa do Node para gerar códigos
 const dotenv = require('dotenv');
 dotenv.config();
 const cors = require('cors');
 const express = require('express');
 const mongoose = require('mongoose');
-const User = require('./models/user');
+const { User, Pedido } = require('./models/user');
 const nodemailer = require('nodemailer');
 
 
@@ -101,7 +102,7 @@ app.post('/api/login', async (req, res) => {
        
         // 1. Procura no banco se existe algum usuário com esse e-mail
 
-        const usuarioEncontrado = await User.findOne({ email });
+        const usuarioEncontrado = await User.findOne({ email: email.toLowerCase() });
         // Se não encontrar o e-mail, barra o acesso
 
         if (!usuarioEncontrado) {
@@ -134,10 +135,149 @@ app.post('/api/login', async (req, res) => {
 
 });
 
+// Rota ESQUECI SENHA
+
+
+app.post('/api/esqueci-senha', async (req, res) => {
+
+try {
+
+   const { email } = req.body;
+   const usuario = await User.findOne({ email });
+
+   if(!usuario) {
+   return res.status(404).json({ erro: 'E-mail não localizado'});
+   }
+
+   // 1. Gera um Token aleatório de 20 caracteres
+        const token = crypto.randomBytes(20).toString('hex');
+
+
+        // 2. Salva no banco o token e o tempo de validade (1 hora)
+        usuario.resetPasswordToken = token;
+        usuario.resetPasswordExpires = Date.now() + 3600000; // +1 hora
+        await usuario.save();
+
+        // 3. Monta o link mágico que vai levar para o seu React
+        const linkRecuperacao = `http://localhost:5173/redefinir-senha/${token}`;
+
+        // 4. Envia o e-mail
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: '☕ Anteiku - Redefinição de Senha',
+            html: `
+                <div style="font-family: Arial, sans-serif; text-align: center;">
+                    <h2>Olá, ${usuario.nome}!</h2>
+                    <p>Você solicitou a redefinição da sua senha.</p>
+                    <p>Clique no botão abaixo para criar uma nova senha:</p>
+                    <a href="${linkRecuperacao}" style="background-color: #d4a373; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 20px 0;">
+                        Redefinir Minha Senha
+                    </a>
+                    <p style="color: #888; font-size: 12px;">Se você não pediu isso, ignore este e-mail. O link expira em 1 hora.</p>
+                </div>
+            `
+        };
+
+        await transporter.sendMail(mailOptions);
+        res.status(200).json({ mensagem: 'Link de recuperação enviado para o seu e-mail!' });
+
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao processar recuperação.' });
+    }
+
+    });
+
+    // 🚀 ROTA 2: RECEBE A NOVA SENHA E SALVA NO BANCO
+
+    app.post('/api/redefinir-senha', async ( req, res) => {
+
+    try {
+
+     // Procura alguém que tenha ESSE token e que o tempo ainda NÃO expirou ($gt = greater than / maior que agora)
+
+       const {token, novaSenha } = req.body;
+
+       const usuario = await User.findOne({
+       resetPasswordToken: token,
+       resetPasswordExpires: { $gt: Date.now() }
+       });
+
+       if (!usuario) {
+
+       return res.status(400).json({ erro: 'O link de recuperação está incorreto'});
+     }
+
+
+      // Salva a nova senha e apaga o token do banco (para não ser usado de novo)
+        usuario.senha = novaSenha;
+        usuario.resetPasswordToken = undefined;
+        usuario.resetPasswordExpires = undefined;
+        await usuario.save();
+
+        res.status(200).json({ mensagem: 'Sua senha foi redefinida com sucesso!' });
+
+        } catch (error) {
+        res.status(500).json({ erro: 'Erro ao redefinir a senha.' });
+    }
+
+    });
+
+app.put('/api/usuarios/pontos', async (req, res) => {
+    try {
+        const {email, pontosGanhos} = req.body;
+        
+        const usuarioAtualizado = await User.findOneAndUpdate(
+            {email: email},
+            {$inc: {pontos: pontosGanhos } }, // 🚀 $inc = SOMA com o que já tem!
+            { new: true } // Retorna o usuário já com os pontos novos
+            );
+       res.status(200).json({ mensagem: 'Pontos adicionados!', pontos: usuarioAtualizado.pontos });
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao salvar pontos no banco' });
+    }
+});
+
 
 
 app.get('/', (req, res) => {
     res.send('Servidor está online');
+});
+
+
+
+// ROTA 1: Cliente faz o pedido
+app.post('/api/pedidos', async (req, res) => {
+    try {
+        const novoPedido = new Pedido(req.body);
+        await novoPedido.save();
+        res.status(201).json(novoPedido);
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao registrar pedido' });
+    }
+});
+
+// ROTA 2: Gerente lista todos os pedidos
+app.get('/api/pedidos', async (req, res) => {
+    try {
+        const lista = await Pedido.find({status: 'Pendente'}).sort({ data: -1 }); // Mostra os mais recentes primeiro
+        res.json(lista);
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao buscar pedidos' });
+    }
+});
+
+// ADICIONE ESTA NOVA ROTA (Atualiza o pedido no banco)
+app.put('/api/pedidos/:id/status', async (req, res) => {
+    try {
+        const pedidoId = req.params.id;
+        const { status } = req.body;
+        
+        await Pedido.findByIdAndUpdate(pedidoId, { status: status });
+        res.status(200).json({ mensagem: 'Status atualizado com sucesso' });
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao atualizar status' });
+    }
 });
 
 app.listen(PORT, () => {
