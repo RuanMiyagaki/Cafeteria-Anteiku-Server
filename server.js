@@ -4,7 +4,7 @@ dotenv.config();
 const cors = require('cors');
 const express = require('express');
 const mongoose = require('mongoose');
-const { User, Pedido } = require('./models/user');
+const { User, Pedido, Unidade } = require('./models/user');
 const nodemailer = require('nodemailer');
 
 
@@ -38,17 +38,36 @@ app.post('/api/usuarios', async (req, res) => {
     try {
         const { nome, email, senha } = req.body;
 
-        // Cria um novo usuário usando o molde (Model)
+        // 1. Gera um código de 6 números aleatórios
+        const codigoGerado = Math.floor(100000 + Math.random() * 900000).toString();
 
-        const novoUsuario = new User({
+        let usuarioExiste = await User.findOne({ email });
+
+        if ( usuarioExiste) {
+
+            if (usuarioExiste.isVerified) {
+                return res.status(400).json({ erro: 'Esse e-mail já está cadastrado e validado no sistema'});
+            } else {
+                usuarioExiste.nome = nome;
+                usuarioExiste.senha = senha;
+                usuarioExiste.codigoVerificacao = codigoGerado;
+                await usuarioExiste.save();
+            }
+        } else {
+const novoUsuario = new User({
         nome,
         email,
-        senha
+        senha,
+        codigoVerificacao: codigoGerado
         });
 
         // Salva no banco de dados
 
         await novoUsuario.save();
+        }
+        
+        // Cria um novo usuário usando o molde (Model)
+
 
 
         // PREPARAR E ENVIAR O EMAIL
@@ -56,44 +75,62 @@ app.post('/api/usuarios', async (req, res) => {
         const emailOptions = {
             from: process.env.EMAIL_USER,
             to: email,
-            subject: 'Sua conta na Anteiku foi criada com sucesso! ☕',
+            subject: '☕ Anteiku - Seu código de verificação',
             html: `
-              <div style="font-family: sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
-                <h2 style="color: #d4a373; text-align: center;">Bem-vindo(a) à Anteiku, ${nome}!</h2>
-                <p>É um prazer ter você conosco. Seu cadastro foi realizado com sucesso e agora você faz parte do nosso clube de clientes.</p>
-                <p>Para celebrar sua chegada, utilize o cupom abaixo em sua próxima visita para receber <strong>15% de desconto</strong>:</p>
-                <div style="text-align: center; margin: 20px 0;">
-                  <span style="background-color: #27ae60; color: white; padding: 10px 20px; font-size: 20px; font-weight: bold; border-radius: 5px;">ANTEIKU15</span>
-                </div>
-                <p>Esperamos te ver em breve!</p>
-                <p style="font-size: 12px; color: #888; text-align: center; margin-top: 30px;">© 2026 Cafeteria Anteiku. Distrito 20.</p>
+              <div style="font-family: sans-serif; text-align: center;">
+                <h2>Olá, ${nome}!</h2>
+                <p>Para concluir seu cadastro, use o código abaixo:</p>
+                <h1 style="color: #d4a373; font-size: 40px; letter-spacing: 5px;">${codigoGerado}</h1>
+                <p>Digite este código na tela do site para liberar seu acesso.</p>
               </div>
             `
         };
 
         // Dispara o e-mail em segundo plano (sem o 'await' para não atrasar a resposta pro usuário)
 
-        transporter.sendMail(emailOptions, (error, info) => {
-            if (error) {
-                console.error("Erro ao enviar o e-mail de boas vindas", error); 
-            } else {
-                console.log("E-mail de boas vindas enviado para:", info.accepted);
-            }
-        });
+        await transporter.sendMail(emailOptions);
+        res.status(201).json({ mensagem: 'Código enviado para o e-mail!'});
 
-
-
-// Responde ao Front que deu tudo certo:
-
-        res.status(201).json({ mensagem: 'Usuário cadastrado com sucesso', usuario: novoUsuario});
     } catch (error) {
-        if (error.code === 11000) {
-            return res.status(400).json({erro: 'Esse email já está cadastrado'});
-        }
-
+        if (error.code === 11000) return res.status(400).json({erro: 'Esse email já está cadastrado'});
         return res.status(500).json({erro: 'Erro interno no servidor.'});
     }
-})
+});
+
+
+// --- ROTA DE VERIFICAÇÃO DO CÓDIGO ---
+app.post('/api/verificar-codigo', async (req, res) => {
+    try {
+        const { email, codigo } = req.body;
+
+        // 1. Procura o cliente na gaveta (banco de dados)
+        const usuario = await User.findOne({ email });
+
+        if (!usuario) {
+            return res.status(404).json({ erro: 'Usuário não encontrado.' });
+        }
+
+        // 2. Confere se a chave que ele trouxe é a correta
+        if (usuario.codigoVerificacao !== codigo) {
+            return res.status(400).json({ erro: 'Código incorreto!' });
+        }
+
+        // 3. Destranca a conta e joga a chave fora
+        usuario.isVerified = true;
+        usuario.codigoVerificacao = undefined; 
+        await usuario.save();
+
+        // 4. Devolve o usuário para o React (assim o React consegue mostrar o cupom na tela!)
+        res.status(200).json({ 
+            mensagem: 'Conta verificada com sucesso!',
+            usuario: usuario 
+        });
+
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao verificar código.' });
+    }
+});
+
 
 // --- NOVA ROTA DE LOGIN ---
 app.post('/api/login', async (req, res) => {
@@ -116,6 +153,10 @@ app.post('/api/login', async (req, res) => {
             return res.status(400).json({erro: 'Senha incorreta'});
 
 
+        }
+
+        if (!usuarioEncontrado.isVerified) {
+            return res.status(401).json({ erro: 'Acesso negado. Por favor, verifique seu e-mail com o código que enviamos no momento do cadastro.' });
         }
 
         // 3. Se tudo estiver certo, libera o acesso e devolve os dados
@@ -238,8 +279,40 @@ app.put('/api/usuarios/pontos', async (req, res) => {
     }
 });
 
+app.put('/api/usuarios/resgatar-pontos', async (req, res) => {
+    try {
+        // Agora o React vai mandar o código do cupom também
+        const { email, gasto, recompensaCodigo } = req.body;
 
+        // Procura no banco (garantindo que o email esteja em minúsculo)
+        const usuario = await User.findOne({ email: email.toLowerCase() });
 
+        if (!usuario) {
+            return res.status(404).json({ erro: 'Usuário não encontrado' });
+        }
+
+        // A VALIDAÇÃO REAL DO BANCO DE DADOS
+        if (usuario.pontos < gasto) {
+            return res.status(400).json({ erro: 'Saldo insuficiente no banco de dados' });
+        }
+
+        // Desconta os pontos
+        usuario.pontos -= gasto;
+
+        // 🎟️ Se a recompensa for um cupom, injeta na conta do usuário!
+        if (recompensaCodigo) {
+            usuario.cupom = recompensaCodigo;
+        }
+
+        await usuario.save();
+
+        res.status(200).json({ mensagem: 'Recompensa resgatada!', pontosAtualizados: usuario.pontos });
+
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro interno ao resgatar' });
+    }
+});
+    
 app.get('/', (req, res) => {
     res.send('Servidor está online');
 });
@@ -247,13 +320,55 @@ app.get('/', (req, res) => {
 
 
 // ROTA 1: Cliente faz o pedido
+// --- ROTA DE CRIAR PEDIDO SEGURO ---
 app.post('/api/pedidos', async (req, res) => {
     try {
-        const novoPedido = new Pedido(req.body);
+        const { clienteNome, clienteEmail, itens, cupomDigitado } = req.body;
+
+        // 1. Busca o usuário no banco para verificar se ele realmente possui esse cupom ativo
+        const usuario = await User.findOne({ email: clienteEmail });
+
+        let valorCalculadoPeloServidor = 0;
+        let descontoAplicado = false;
+
+        // 2. O Servidor faz a matemática rodar de forma isolada e segura
+        itens.forEach((item) => {
+            // Verifica se o cupom digitado bate com o cupom que o usuário tem direito no banco
+            if (cupomDigitado === 'BEMVINDO50' && usuario && usuario.cupom === 'BEMVINDO50' && !descontoAplicado) {
+                
+                // Aplica 50% de desconto em apenas 1 unidade do produto
+                const precoComDesconto = item.preco * 0.5;
+                const unidadesPrecoCheio = item.preco * (item.quantidade - 1);
+                
+                valorCalculadoPeloServidor += precoComDesconto + unidadesPrecoCheio;
+                descontoAplicado = true; // Bloqueia para não dar desconto em mais nada
+            } else {
+                valorCalculadoPeloServidor += item.preco * item.quantidade;
+            }
+        });
+
+        // 3. Se o cupom foi usado com sucesso, nós "limpamos" o campo cupom do usuário no banco
+        if (descontoAplicado && cupomDigitado === 'BEMVINDO50') {
+            usuario.cupom = ''; // Remove o cupom para que ele se torne descartável (impossível re-utilizar)
+            await usuario.save();
+        }
+
+        // 4. Salva o pedido com o valor blindado calculado pelo próprio servidor
+        const novoPedido = new Pedido({
+            clienteNome,
+            clienteEmail,
+            valor: valorCalculadoPeloServidor, // Valor seguro
+            status: 'Pendente',
+            itens: itens, // Guarda o que ele comprou
+            data: new Date()
+        });
+
         await novoPedido.save();
         res.status(201).json(novoPedido);
+
     } catch (error) {
-        res.status(500).json({ erro: 'Erro ao registrar pedido' });
+        console.error(error);
+        res.status(500).json({ erro: 'Erro ao registrar pedido com segurança' });
     }
 });
 
@@ -277,6 +392,18 @@ app.put('/api/pedidos/:id/status', async (req, res) => {
         res.status(200).json({ mensagem: 'Status atualizado com sucesso' });
     } catch (error) {
         res.status(500).json({ erro: 'Erro ao atualizar status' });
+    }
+});
+
+app.get('/api/unidades', async (req, res) => {
+    try {
+        // Busca todas as cafeterias cadastradas no estoque (MongoDB)
+        const listaUnidades = await Unidade.find(); 
+        
+        // Entrega a lista pro garçom levar até o React
+        res.status(200).json(listaUnidades); 
+    } catch (error) {
+        res.status(500).json({ erro: 'Erro ao buscar as unidades no banco.' });
     }
 });
 
