@@ -6,13 +6,15 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { User, Pedido, Unidade } = require('./models/user');
 const nodemailer = require('nodemailer');
-
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
 app.use(express.json()); // Permite que o servidor entenda JSON
 
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'secretKeyAnteikuDistrito20';
 
 // REALIZANDO A CONEXÃO COM O MONGO DB
 mongoose.connect(process.env.MONGO_URI)
@@ -20,20 +22,60 @@ mongoose.connect(process.env.MONGO_URI)
 .catch((err) => console.error('Erro ao conectar no MongoDB', err));
 
 
-//CONFIGURAÇÃO DO NODEMAILER
-
+// CONFIGURAÇÃO DO NODEMAILER
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
         user: process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASS
-
     }
 });
 
+// --- MIDDLEWARES DE SEGURANÇA ---
 
-// --- NOVA ROTA DE CADASTRO ---
+// 1. Exige autenticação por JWT
+const autenticarToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
+    if (!token) {
+        return res.status(401).json({ erro: 'Acesso negado. Token de autenticação não fornecido.' });
+    }
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ erro: 'Sessão expirada ou token inválido. Faça login novamente.' });
+        }
+        req.user = user;
+        next();
+    });
+};
+
+// 2. Identifica o usuário se houver token, mas não barra se for Guest
+const identificarToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return next();
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (!err) {
+            req.user = user;
+        }
+        next();
+    });
+};
+
+// 3. Garante que apenas o Gerente acesse a rota
+const verificarGerente = (req, res, next) => {
+    if (req.user && req.user.email === 'kakashacafe@gmail.com') {
+        next();
+    } else {
+        return res.status(403).json({ erro: 'Acesso negado. Apenas o Gerente Yoshimura possui acesso a este recurso.' });
+    }
+};
+
+
+// --- ROTA DE CADASTRO ---
 app.post('/api/usuarios', async (req, res) => {
     try {
         const { nome, email, senha } = req.body;
@@ -41,37 +83,33 @@ app.post('/api/usuarios', async (req, res) => {
         // 1. Gera um código de 6 números aleatórios
         const codigoGerado = Math.floor(100000 + Math.random() * 900000).toString();
 
-        let usuarioExiste = await User.findOne({ email });
+        let usuarioExiste = await User.findOne({ email: email.toLowerCase() });
 
-        if ( usuarioExiste) {
+        // Criptografa a senha com Bcrypt
+        const hashedSenha = await bcrypt.hash(senha, 10);
 
+        if (usuarioExiste) {
             if (usuarioExiste.isVerified) {
-                return res.status(400).json({ erro: 'Esse e-mail já está cadastrado e validado no sistema'});
+                return res.status(400).json({ erro: 'Esse e-mail já está cadastrado e validado no sistema' });
             } else {
                 usuarioExiste.nome = nome;
-                usuarioExiste.senha = senha;
+                usuarioExiste.senha = hashedSenha;
                 usuarioExiste.codigoVerificacao = codigoGerado;
                 await usuarioExiste.save();
             }
         } else {
-const novoUsuario = new User({
-        nome,
-        email,
-        senha,
-        codigoVerificacao: codigoGerado
-        });
+            const novoUsuario = new User({
+                nome,
+                email: email.toLowerCase(),
+                senha: hashedSenha,
+                codigoVerificacao: codigoGerado
+            });
 
-        // Salva no banco de dados
-
-        await novoUsuario.save();
+            // Salva no banco de dados
+            await novoUsuario.save();
         }
-        
-        // Cria um novo usuário usando o molde (Model)
-
-
 
         // PREPARAR E ENVIAR O EMAIL
-
         const emailOptions = {
             from: process.env.EMAIL_USER,
             to: email,
@@ -86,14 +124,13 @@ const novoUsuario = new User({
             `
         };
 
-        // Dispara o e-mail em segundo plano (sem o 'await' para não atrasar a resposta pro usuário)
-
+        // Dispara o e-mail em segundo plano
         await transporter.sendMail(emailOptions);
-        res.status(201).json({ mensagem: 'Código enviado para o e-mail!'});
+        res.status(201).json({ mensagem: 'Código enviado para o e-mail!' });
 
     } catch (error) {
-        if (error.code === 11000) return res.status(400).json({erro: 'Esse email já está cadastrado'});
-        return res.status(500).json({erro: 'Erro interno no servidor.'});
+        if (error.code === 11000) return res.status(400).json({ erro: 'Esse e-mail já está cadastrado' });
+        return res.status(500).json({ erro: 'Erro interno no servidor.' });
     }
 });
 
@@ -103,24 +140,20 @@ app.post('/api/verificar-codigo', async (req, res) => {
     try {
         const { email, codigo } = req.body;
 
-        // 1. Procura o cliente na gaveta (banco de dados)
-        const usuario = await User.findOne({ email });
+        const usuario = await User.findOne({ email: email.toLowerCase() });
 
         if (!usuario) {
             return res.status(404).json({ erro: 'Usuário não encontrado.' });
         }
 
-        // 2. Confere se a chave que ele trouxe é a correta
         if (usuario.codigoVerificacao !== codigo) {
             return res.status(400).json({ erro: 'Código incorreto!' });
         }
 
-        // 3. Destranca a conta e joga a chave fora
         usuario.isVerified = true;
         usuario.codigoVerificacao = undefined; 
         await usuario.save();
 
-        // 4. Devolve o usuário para o React (assim o React consegue mostrar o cupom na tela!)
         res.status(200).json({ 
             mensagem: 'Conta verificada com sucesso!',
             usuario: usuario 
@@ -132,77 +165,68 @@ app.post('/api/verificar-codigo', async (req, res) => {
 });
 
 
-// --- NOVA ROTA DE LOGIN ---
+// --- ROTA DE LOGIN ---
 app.post('/api/login', async (req, res) => {
     try {
         const { email, senha } = req.body;
        
-        // 1. Procura no banco se existe algum usuário com esse e-mail
-
         const usuarioEncontrado = await User.findOne({ email: email.toLowerCase() });
-        // Se não encontrar o e-mail, barra o acesso
 
         if (!usuarioEncontrado) {
-            return res.status(400).json({erro: 'Usuário não localizado no sistema, verifique seu e-mail e tente novamente'});
-
+            return res.status(400).json({ erro: 'Usuário não localizado no sistema, verifique seu e-mail e tente novamente' });
         }
 
-        // 2. Verifica se a senha que ele digitou bate com a do banco
-
-        if (senha !== usuarioEncontrado.senha) {
-            return res.status(400).json({erro: 'Senha incorreta'});
-
-
+        // Compara a senha criptografada usando Bcrypt
+        const senhaCorreta = await bcrypt.compare(senha, usuarioEncontrado.senha);
+        if (!senhaCorreta) {
+            return res.status(400).json({ erro: 'Senha incorreta' });
         }
 
         if (!usuarioEncontrado.isVerified) {
             return res.status(401).json({ erro: 'Acesso negado. Por favor, verifique seu e-mail com o código que enviamos no momento do cadastro.' });
         }
 
-        // 3. Se tudo estiver certo, libera o acesso e devolve os dados
+        // Gera token JWT assinado
+        const token = jwt.sign(
+            { id: usuarioEncontrado._id, email: usuarioEncontrado.email },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
 
         res.status(200).json({
             mensagem: 'Login realizado com sucesso',
-            usuario: usuarioEncontrado
+            usuario: {
+                nome: usuarioEncontrado.nome,
+                email: usuarioEncontrado.email,
+                pontos: usuarioEncontrado.pontos,
+                cupom: usuarioEncontrado.cupom
+            },
+            token
         });
-    }
-
-
-    catch (error) {
-
+    } catch (error) {
         console.error('Erro no login', error);
-        res.status(500).json({erro: 'Erro interno do servidor'});
+        res.status(500).json({ erro: 'Erro interno do servidor' });
     }
-
 });
 
-// Rota ESQUECI SENHA
 
-
+// --- ROTA ESQUECI SENHA ---
 app.post('/api/esqueci-senha', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const usuario = await User.findOne({ email: email.toLowerCase() });
 
-try {
+        if (!usuario) {
+            return res.status(404).json({ erro: 'E-mail não localizado' });
+        }
 
-   const { email } = req.body;
-   const usuario = await User.findOne({ email });
-
-   if(!usuario) {
-   return res.status(404).json({ erro: 'E-mail não localizado'});
-   }
-
-   // 1. Gera um Token aleatório de 20 caracteres
         const token = crypto.randomBytes(20).toString('hex');
-
-
-        // 2. Salva no banco o token e o tempo de validade (1 hora)
         usuario.resetPasswordToken = token;
         usuario.resetPasswordExpires = Date.now() + 3600000; // +1 hora
         await usuario.save();
 
-        // 3. Monta o link mágico que vai levar para o seu React
         const linkRecuperacao = `http://localhost:5173/redefinir-senha/${token}`;
 
-        // 4. Envia o e-mail
         const mailOptions = {
             from: process.env.EMAIL_USER,
             to: email,
@@ -226,140 +250,138 @@ try {
     } catch (error) {
         res.status(500).json({ erro: 'Erro ao processar recuperação.' });
     }
+});
 
-    });
 
-    // 🚀 ROTA 2: RECEBE A NOVA SENHA E SALVA NO BANCO
-
-    app.post('/api/redefinir-senha', async ( req, res) => {
-
+// --- ROTA REDEFINIR SENHA ---
+app.post('/api/redefinir-senha', async (req, res) => {
     try {
+        const { token, novaSenha } = req.body;
 
-     // Procura alguém que tenha ESSE token e que o tempo ainda NÃO expirou ($gt = greater than / maior que agora)
+        const usuario = await User.findOne({
+            resetPasswordToken: token,
+            resetPasswordExpires: { $gt: Date.now() }
+        });
 
-       const {token, novaSenha } = req.body;
+        if (!usuario) {
+            return res.status(400).json({ erro: 'O link de recuperação está incorreto ou expirou' });
+        }
 
-       const usuario = await User.findOne({
-       resetPasswordToken: token,
-       resetPasswordExpires: { $gt: Date.now() }
-       });
-
-       if (!usuario) {
-
-       return res.status(400).json({ erro: 'O link de recuperação está incorreto'});
-     }
-
-
-      // Salva a nova senha e apaga o token do banco (para não ser usado de novo)
-        usuario.senha = novaSenha;
+        // Criptografa a nova senha com Bcrypt
+        usuario.senha = await bcrypt.hash(novaSenha, 10);
         usuario.resetPasswordToken = undefined;
         usuario.resetPasswordExpires = undefined;
         await usuario.save();
 
         res.status(200).json({ mensagem: 'Sua senha foi redefinida com sucesso!' });
 
-        } catch (error) {
+    } catch (error) {
         res.status(500).json({ erro: 'Erro ao redefinir a senha.' });
     }
+});
 
-    });
 
-app.put('/api/usuarios/pontos', async (req, res) => {
+// --- ROTA DE ADICIONAR PONTOS (APENAS GERENTE) ---
+app.put('/api/usuarios/pontos', autenticarToken, verificarGerente, async (req, res) => {
     try {
-        const {email, pontosGanhos} = req.body;
+        const { email, pontosGanhos } = req.body;
         
         const usuarioAtualizado = await User.findOneAndUpdate(
-            {email: email},
-            {$inc: {pontos: pontosGanhos } }, // 🚀 $inc = SOMA com o que já tem!
-            { new: true } // Retorna o usuário já com os pontos novos
-            );
-       res.status(200).json({ mensagem: 'Pontos adicionados!', pontos: usuarioAtualizado.pontos });
+            { email: email.toLowerCase() },
+            { $inc: { pontos: pontosGanhos } }, 
+            { new: true }
+        );
+        res.status(200).json({ mensagem: 'Pontos adicionados!', pontos: usuarioAtualizado.pontos });
     } catch (error) {
         res.status(500).json({ erro: 'Erro ao salvar pontos no banco' });
     }
 });
 
-app.put('/api/usuarios/resgatar-pontos', async (req, res) => {
+
+// --- ROTA DE RESGATAR PONTOS (APENAS O PRÓPRIO USUÁRIO) ---
+app.put('/api/usuarios/resgatar-pontos', autenticarToken, async (req, res) => {
     try {
-        // Agora o React vai mandar o código do cupom também
         const { email, gasto, recompensaCodigo } = req.body;
 
-        // Procura no banco (garantindo que o email esteja em minúsculo)
+        // Segurança extra: impede que um usuário gaste pontos de outro
+        if (req.user.email !== email.toLowerCase()) {
+            return res.status(403).json({ erro: 'Acesso negado. Você não pode resgatar pontos para outra conta.' });
+        }
+
         const usuario = await User.findOne({ email: email.toLowerCase() });
 
         if (!usuario) {
             return res.status(404).json({ erro: 'Usuário não encontrado' });
         }
 
-        // A VALIDAÇÃO REAL DO BANCO DE DADOS
         if (usuario.pontos < gasto) {
-            return res.status(400).json({ erro: 'Saldo insuficiente no banco de dados' });
+            return res.status(400).json({ erro: 'Saldo insuficiente de pontos.' });
         }
 
-        // Desconta os pontos
         usuario.pontos -= gasto;
 
-        // 🎟️ Se a recompensa for um cupom, injeta na conta do usuário!
         if (recompensaCodigo) {
             usuario.cupom = recompensaCodigo;
         }
 
         await usuario.save();
-
         res.status(200).json({ mensagem: 'Recompensa resgatada!', pontosAtualizados: usuario.pontos });
 
     } catch (error) {
         res.status(500).json({ erro: 'Erro interno ao resgatar' });
     }
 });
-    
+
+
+// --- ROTA INICIAL DE STATUS ---
 app.get('/', (req, res) => {
-    res.send('Servidor está online');
+    res.send('Servidor Anteiku está online e seguro');
 });
 
 
-
-// ROTA 1: Cliente faz o pedido
-// --- ROTA DE CRIAR PEDIDO SEGURO ---
-app.post('/api/pedidos', async (req, res) => {
+// --- ROTA DE CRIAR PEDIDO (GUESTS OU CLIENTES AUTENTICADOS) ---
+app.post('/api/pedidos', identificarToken, async (req, res) => {
     try {
         const { clienteNome, clienteEmail, itens, cupomDigitado } = req.body;
 
-        // 1. Busca o usuário no banco para verificar se ele realmente possui esse cupom ativo
-        const usuario = await User.findOne({ email: clienteEmail });
+        let emailVerificado = clienteEmail;
+        if (req.user) {
+            emailVerificado = req.user.email; // Se logado, sobrepõe com email do token por segurança
+        }
+
+        const usuario = emailVerificado ? await User.findOne({ email: emailVerificado.toLowerCase() }) : null;
 
         let valorCalculadoPeloServidor = 0;
         let descontoAplicado = false;
 
-        // 2. O Servidor faz a matemática rodar de forma isolada e segura
-        itens.forEach((item) => {
-            // Verifica se o cupom digitado bate com o cupom que o usuário tem direito no banco
-            if (cupomDigitado === 'BEMVINDO50' && usuario && usuario.cupom === 'BEMVINDO50' && !descontoAplicado) {
-                
-                // Aplica 50% de desconto em apenas 1 unidade do produto
-                const precoComDesconto = item.preco * 0.5;
-                const unidadesPrecoCheio = item.preco * (item.quantidade - 1);
-                
-                valorCalculadoPeloServidor += precoComDesconto + unidadesPrecoCheio;
-                descontoAplicado = true; // Bloqueia para não dar desconto em mais nada
-            } else {
-                valorCalculadoPeloServidor += item.preco * item.quantidade;
-            }
-        });
+        // Se veio array de itens, calcula o valor seguro do lado do servidor
+        if (itens && Array.isArray(itens) && itens.length > 0) {
+            itens.forEach((item) => {
+                if (cupomDigitado && usuario && usuario.cupom === cupomDigitado && !descontoAplicado) {
+                    const precoComDesconto = item.preco * 0.5;
+                    const unidadesPrecoCheio = item.preco * (item.quantidade - 1);
+                    valorCalculadoPeloServidor += precoComDesconto + unidadesPrecoCheio;
+                    descontoAplicado = true;
+                } else {
+                    valorCalculadoPeloServidor += item.preco * item.quantidade;
+                }
+            });
+        } else {
+            // Fallback para pedidos rápidos/customizados de valor fixo direto
+            valorCalculadoPeloServidor = Number(req.body.valor) || 0;
+        }
 
-        // 3. Se o cupom foi usado com sucesso, nós "limpamos" o campo cupom do usuário no banco
-        if (descontoAplicado && cupomDigitado === 'BEMVINDO50') {
-            usuario.cupom = ''; // Remove o cupom para que ele se torne descartável (impossível re-utilizar)
+        if (descontoAplicado && usuario && cupomDigitado) {
+            usuario.cupom = ''; // Consome o cupom
             await usuario.save();
         }
 
-        // 4. Salva o pedido com o valor blindado calculado pelo próprio servidor
         const novoPedido = new Pedido({
-            clienteNome,
-            clienteEmail,
-            valor: valorCalculadoPeloServidor, // Valor seguro
+            clienteNome: clienteNome || (usuario ? usuario.nome : "Cliente Anônimo"),
+            clienteEmail: emailVerificado || "anonimo@anteiku.com",
+            valor: valorCalculadoPeloServidor,
             status: 'Pendente',
-            itens: itens, // Guarda o que ele comprou
+            itens: itens || [],
             data: new Date()
         });
 
@@ -372,18 +394,20 @@ app.post('/api/pedidos', async (req, res) => {
     }
 });
 
-// ROTA 2: Gerente lista todos os pedidos
-app.get('/api/pedidos', async (req, res) => {
+
+// --- ROTA DE BUSCAR PEDIDOS PENDENTES (APENAS GERENTE) ---
+app.get('/api/pedidos', autenticarToken, verificarGerente, async (req, res) => {
     try {
-        const lista = await Pedido.find({status: 'Pendente'}).sort({ data: -1 }); // Mostra os mais recentes primeiro
+        const lista = await Pedido.find({ status: 'Pendente' }).sort({ data: -1 });
         res.json(lista);
     } catch (error) {
         res.status(500).json({ erro: 'Erro ao buscar pedidos' });
     }
 });
 
-// ADICIONE ESTA NOVA ROTA (Atualiza o pedido no banco)
-app.put('/api/pedidos/:id/status', async (req, res) => {
+
+// --- ROTA DE ATUALIZAR STATUS DO PEDIDO (APENAS GERENTE) ---
+app.put('/api/pedidos/:id/status', autenticarToken, verificarGerente, async (req, res) => {
     try {
         const pedidoId = req.params.id;
         const { status } = req.body;
@@ -395,18 +419,18 @@ app.put('/api/pedidos/:id/status', async (req, res) => {
     }
 });
 
+
+// --- ROTA DE UNIDADES DA CAFETERIA (MAPA) ---
 app.get('/api/unidades', async (req, res) => {
     try {
-        // Busca todas as cafeterias cadastradas no estoque (MongoDB)
         const listaUnidades = await Unidade.find(); 
-        
-        // Entrega a lista pro garçom levar até o React
         res.status(200).json(listaUnidades); 
     } catch (error) {
         res.status(500).json({ erro: 'Erro ao buscar as unidades no banco.' });
     }
 });
 
+
 app.listen(PORT, () => {
-console.log(`Servidor está rodando na porta ${PORT}`);
-})
+    console.log(`Servidor seguro rodando na porta ${PORT}`);
+});
